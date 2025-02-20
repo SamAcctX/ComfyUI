@@ -27,6 +27,7 @@ from comfy.cli_args import args
 import comfy.utils
 import comfy.model_management
 import node_helpers
+from comfyui_version import __version__
 from app.frontend_management import FrontendManager
 from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
@@ -44,27 +45,26 @@ async def send_socket_catch_exception(function, message):
     except (aiohttp.ClientError, aiohttp.ClientPayloadError, ConnectionResetError, BrokenPipeError, ConnectionError) as err:
         logging.warning("send error: {}".format(err))
 
-def get_comfyui_version():
-    comfyui_version = "unknown"
-    repo_path = os.path.dirname(os.path.realpath(__file__))
-    try:
-        import pygit2
-        repo = pygit2.Repository(repo_path)
-        comfyui_version = repo.describe(describe_strategy=pygit2.GIT_DESCRIBE_TAGS)
-    except Exception:
-        try:
-            import subprocess
-            comfyui_version = subprocess.check_output(["git", "describe", "--tags"], cwd=repo_path).decode('utf-8')
-        except Exception as e:
-            logging.warning(f"Failed to get ComfyUI version: {e}")
-    return comfyui_version.strip()
-
 @web.middleware
 async def cache_control(request: web.Request, handler):
     response: web.Response = await handler(request)
     if request.path.endswith('.js') or request.path.endswith('.css'):
         response.headers.setdefault('Cache-Control', 'no-cache')
     return response
+
+
+@web.middleware
+async def compress_body(request: web.Request, handler):
+    accept_encoding = request.headers.get("Accept-Encoding", "")
+    response: web.Response = await handler(request)
+    if not isinstance(response, web.Response):
+        return response
+    if response.content_type not in ["application/json", "text/plain"]:
+        return response
+    if response.body and "gzip" in accept_encoding:
+        response.enable_compression()
+    return response
+
 
 def create_cors_middleware(allowed_origin: str):
     @web.middleware
@@ -150,7 +150,8 @@ class PromptServer():
         PromptServer.instance = self
 
         mimetypes.init()
-        mimetypes.types_map['.js'] = 'application/javascript; charset=utf-8'
+        mimetypes.add_type('application/javascript; charset=utf-8', '.js')
+        mimetypes.add_type('image/webp', '.webp')
 
         self.user_manager = UserManager()
         self.model_file_manager = ModelFileManager()
@@ -164,6 +165,9 @@ class PromptServer():
         self.number = 0
 
         middlewares = [cache_control]
+        if args.enable_compress_response_body:
+            middlewares.append(compress_body)
+
         if args.enable_cors_header:
             middlewares.append(create_cors_middleware(args.enable_cors_header))
         else:
@@ -343,6 +347,9 @@ class PromptServer():
                 original_ref = json.loads(post.get("original_ref"))
                 filename, output_dir = folder_paths.annotated_filepath(original_ref['filename'])
 
+                if not filename:
+                    return web.Response(status=400)
+
                 # validation for security: prevent accessing arbitrary path
                 if filename[0] == '/' or '..' in filename:
                     return web.Response(status=400)
@@ -383,6 +390,9 @@ class PromptServer():
             if "filename" in request.rel_url.query:
                 filename = request.rel_url.query["filename"]
                 filename,output_dir = folder_paths.annotated_filepath(filename)
+
+                if not filename:
+                    return web.Response(status=400)
 
                 # validation for security: prevent accessing arbitrary path
                 if filename[0] == '/' or '..' in filename:
@@ -518,7 +528,7 @@ class PromptServer():
                     "os": os.name,
                     "ram_total": ram_total,
                     "ram_free": ram_free,
-                    "comfyui_version": get_comfyui_version(),
+                    "comfyui_version": __version__,
                     "python_version": sys.version,
                     "pytorch_version": comfy.model_management.torch_version,
                     "embedded_python": os.path.split(os.path.split(sys.executable)[0])[1] == "python_embeded",
